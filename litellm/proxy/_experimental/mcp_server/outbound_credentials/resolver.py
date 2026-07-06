@@ -8,16 +8,24 @@ an arm fails the type gate (basedpyright `reportMatchNotExhaustive`); a bypassed
 at runtime instead of returning `None`.
 
 `none` and `api_key` (shared-key source) are live, as is `authorization_code`, which reads the
-user's token from the injected `OAuthTokenStore`, and `token_exchange`, which swaps the caller's
-inbound token through the injected `TokenExchanger`. The remaining arms are `not_implemented` stubs
-that each land in a follow-up PR with their seam. Pure v2: no imports from v1.
+user's token from the injected `OAuthTokenStore`, `token_exchange`, which swaps the caller's
+inbound token through the injected `TokenExchanger`, and `client_credentials`, which mints and
+caches the gateway's M2M token through the injected `ClientCredentialsTokenSource`. The remaining
+arms are `not_implemented` stubs that each land in a follow-up PR with their seam. Pure v2: no
+imports from v1.
 """
 
 from __future__ import annotations
 
+from functools import partial
+
 import httpx
 from typing_extensions import assert_never
 
+from litellm.proxy._experimental.mcp_server.outbound_credentials.client_credentials import (
+    ClientCredentialsBearerAuth,
+    ClientCredentialsTokenSource,
+)
 from litellm.proxy._experimental.mcp_server.outbound_credentials.httpx_auth import (
     NoOpAuth,
     StaticHeaderAuth,
@@ -86,9 +94,11 @@ class UpstreamCredentialProvider:
         self,
         oauth_token_store: OAuthTokenStore | None = None,
         token_exchanger: TokenExchanger | None = None,
+        client_credentials_source: ClientCredentialsTokenSource | None = None,
     ) -> None:
         self._oauth_token_store: OAuthTokenStore = oauth_token_store or _NullOAuthTokenStore()
         self._token_exchanger: TokenExchanger = token_exchanger or _NullTokenExchanger()
+        self._client_credentials_source = client_credentials_source or ClientCredentialsTokenSource()
 
     async def resolve_credentials(self, subject: Subject, server: ServerSpec) -> Result[httpx.Auth, CredError]:
         match server.config:
@@ -98,8 +108,8 @@ class UpstreamCredentialProvider:
                 return self._api_key(config)
             case PassthroughConfig():
                 return _not_implemented(AuthSpecKind.passthrough)
-            case ClientCredentialsConfig():
-                return _not_implemented(AuthSpecKind.client_credentials)
+            case ClientCredentialsConfig() as config:
+                return await self._client_credentials(server.server_id, config)
             case TokenExchangeConfig() as config:
                 return await self._token_exchange(subject, server, config)
             case AuthorizationCodeConfig():
@@ -134,6 +144,23 @@ class UpstreamCredentialProvider:
             return Error(CredError.of_unauthorized("Authorization required: complete the OAuth flow for this server."))
         return Ok(StaticHeaderAuth(f"Bearer {token.access_token}", header_name="Authorization"))
 
+    async def _client_credentials(
+        self, server_id: str, config: ClientCredentialsConfig
+    ) -> Result[httpx.Auth, CredError]:
+        """The M2M arm: resolve a cached (or freshly minted) gateway token; no user context.
+
+        The token is resolved here, before any upstream request, so a misconfigured grant or an
+        unreachable IdP surfaces as a typed ``CredError``. The returned auth carries the source's
+        ``refetch``, so an upstream 401 is retried exactly once with a freshly minted token (the
+        contract's invalid-token recovery); a second 401 surfaces the upstream's own error.
+        """
+        match await self._client_credentials_source.get(server_id, config):
+            case Ok(token):
+                refetch = partial(self._client_credentials_source.refetch, server_id, config)
+                return Ok(ClientCredentialsBearerAuth(token.access_token, refetch))
+            case Error(err):
+                return Error(err)
+
     async def _token_exchange(
         self, subject: Subject, server: ServerSpec, config: TokenExchangeConfig
     ) -> Result[StaticHeaderAuth, CredError]:
@@ -163,8 +190,9 @@ class UpstreamCredentialProvider:
         """Drop any cached credential the resolver owns for this `(subject, server)`.
 
         Used after an upstream rejects the injected credential, so the next resolve re-mints rather
-        than serving the same rejected token until TTL. Only `token_exchange` holds a re-mintable
-        cached credential here; other modes are a no-op.
+        than serving the same rejected token until TTL. Only `token_exchange` re-mints through this
+        seam; `client_credentials` recovers inside its own auth flow (`ClientCredentialsBearerAuth`
+        retries the 401'd request once with a fresh token), and other modes are a no-op.
         """
         if isinstance(server.config, TokenExchangeConfig) and subject.inbound_token is not None:
             await self._token_exchanger.invalidate(
