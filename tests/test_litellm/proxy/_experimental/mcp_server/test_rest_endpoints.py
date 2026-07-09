@@ -1698,6 +1698,9 @@ class TestCallToolRestAPI:
         monkeypatch.setattr("litellm.proxy.proxy_server.proxy_config", {}, raising=False)
         monkeypatch.setattr(rest_endpoints, "execute_mcp_tool", fake_execute_mcp_tool, raising=False)
 
+        mock_logger = MagicMock()
+        monkeypatch.setattr(rest_endpoints, "verbose_logger", mock_logger, raising=False)
+
         request_payload = {
             "server_id": "server-1",
             "name": "demo-tool",
@@ -1718,6 +1721,12 @@ class TestCallToolRestAPI:
         assert exc_info.value.status_code == upstream_status
         assert exc_info.value.headers is not None
         assert exc_info.value.headers.get("www-authenticate") == challenge
+        # The expected caller-must-reauth signal is logged once, at info, and never at error, so
+        # error-rate alerts do not fire on normal pass-through re-authentication.
+        error_messages = [str(c.args[0]) for c in mock_logger.error.call_args_list if c.args]
+        assert not any("MCP tool call" in m for m in error_messages)
+        info_messages = [str(c.args[0]) for c in mock_logger.info.call_args_list if c.args]
+        assert sum(str(upstream_status) in m for m in info_messages) == 1
 
     async def test_success_logging_cancellation_propagates(self, monkeypatch):
         fire_logging = AsyncMock(side_effect=asyncio.CancelledError())

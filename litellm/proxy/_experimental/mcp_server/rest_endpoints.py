@@ -123,11 +123,21 @@ if MCP_AVAILABLE:
         try:
             return await execute_mcp_tool(**kwargs)
         except MCPUpstreamAuthError as e:
-            verbose_logger.info(f"Upstream auth failure in MCP tool call: HTTP {e.status_code}")
+            # Logged once by the endpoint's except HTTPException handler (at info for 401/403), so the
+            # expected caller-must-reauth signal does not also produce an error-level line here.
             raise e.to_http_exception(
                 base_url=get_request_base_url(request),
                 request_path=request.scope.get("_original_path") or request.url.path,
             )
+
+    def _log_mcp_tool_call_http_exception(e: HTTPException) -> None:
+        # A 401/403 is an expected caller-must-reauth signal (the pass-through upstream relay, or a
+        # permission denial), not an operator-actionable error, so log it at info; anything else stays
+        # error level. Keeps error-rate alerts from firing on normal pass-through re-authentication.
+        if e.status_code in (401, 403):
+            verbose_logger.info(f"MCP tool call returning HTTP {e.status_code}: {str(e.detail)}")
+        else:
+            verbose_logger.error(f"HTTPException in MCP tool call: {str(e)}")
 
     def _get_server_auth_header(
         server,
@@ -1036,8 +1046,9 @@ if MCP_AVAILABLE:
                 },
             )
         except HTTPException as e:
-            # Re-raise HTTPException as-is to preserve status code and detail
-            verbose_logger.error(f"HTTPException in MCP tool call: {str(e)}")
+            # Re-raise as-is; log via the helper so the status-aware level choice (see below) does not
+            # add a branch to this already-complex endpoint.
+            _log_mcp_tool_call_http_exception(e)
             raise e
         except Exception as e:
             verbose_logger.exception(f"Unexpected error in MCP tool call: {str(e)}")
