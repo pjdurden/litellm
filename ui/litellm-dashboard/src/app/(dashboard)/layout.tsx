@@ -6,6 +6,7 @@ import LoadingScreen from "@/components/common_components/LoadingScreen";
 import { ThemeProvider } from "@/contexts/ThemeContext";
 import { useAuth } from "@/contexts/AuthContext";
 import SidebarProvider from "@/app/(dashboard)/components/SidebarProvider";
+import Onboarding from "@/app/onboarding/page";
 import { useRouter, useSearchParams, usePathname } from "next/navigation";
 import { DebugWarningBanner } from "@/components/DebugWarningBanner";
 import { LicenseExpiryBanner } from "@/components/LicenseExpiryBanner";
@@ -147,7 +148,7 @@ function LayoutContent({ children }: { children: React.ReactNode }) {
 
   return (
     <ThemeProvider accessToken={accessToken}>
-      {isInvitationFlow ? children : <DashboardShell>{children}</DashboardShell>}
+      {isInvitationFlow ? <Onboarding /> : <DashboardShell>{children}</DashboardShell>}
     </ThemeProvider>
   );
 }

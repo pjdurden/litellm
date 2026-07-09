@@ -3,10 +3,16 @@ import { render, screen, waitFor } from "@testing-library/react";
 import { AuthProvider } from "@/contexts/AuthContext";
 import Layout from "./layout";
 
+let searchParamsValue = new URLSearchParams();
+
 vi.mock("next/navigation", () => ({
   useRouter: vi.fn(() => ({ push: vi.fn(), replace: vi.fn() })),
-  useSearchParams: vi.fn(() => new URLSearchParams()),
+  useSearchParams: vi.fn(() => searchParamsValue),
   usePathname: vi.fn(() => "/ui/guardrails"),
+}));
+
+vi.mock("@/app/onboarding/page", () => ({
+  default: () => <div data-testid="onboarding" />,
 }));
 
 vi.mock("@/components/navbar", () => ({
@@ -58,6 +64,7 @@ describe("(dashboard) Layout", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     pendingUiConfig = createDeferred();
+    searchParamsValue = new URLSearchParams();
   });
 
   it("does not mount route content until getUiConfig has resolved", async () => {
@@ -78,5 +85,24 @@ describe("(dashboard) Layout", () => {
     await waitFor(() => expect(screen.getByTestId("page-content")).toBeTruthy());
     expect(screen.getByTestId("navbar")).toBeTruthy();
     expect(screen.queryByTestId("loading-screen")).toBeNull();
+  });
+
+  it("renders the onboarding view (not the dashboard shell) for an invitation link", async () => {
+    searchParamsValue = new URLSearchParams("invitation_id=abc123");
+
+    render(
+      <AuthProvider>
+        <Layout>
+          <div data-testid="page-content" />
+        </Layout>
+      </AuthProvider>,
+    );
+
+    pendingUiConfig.resolve();
+
+    await waitFor(() => expect(screen.getByTestId("onboarding")).toBeTruthy());
+    expect(screen.queryByTestId("page-content")).toBeNull();
+    expect(screen.queryByTestId("navbar")).toBeNull();
+    expect(screen.queryByTestId("sidebar")).toBeNull();
   });
 });
