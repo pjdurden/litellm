@@ -786,6 +786,107 @@ class TestMCPServerManager:
         )
         assert result == []
 
+    def _upstream_status_error(self, status_code: int, www_authenticate: Optional[str] = None) -> httpx.HTTPStatusError:
+        """Build an httpx.HTTPStatusError shaped like the one the MCP SDK surfaces for an upstream
+        HTTP failure, so _extract_upstream_auth_failure can read status_code and WWW-Authenticate."""
+        request = httpx.Request("POST", "https://up.example.com/mcp")
+        headers = {"www-authenticate": www_authenticate} if www_authenticate else {}
+        response = httpx.Response(status_code, headers=headers, request=request)
+        return httpx.HTTPStatusError(f"HTTP {status_code}", request=request, response=response)
+
+    def _passthrough_call_server(self, auth_type, server_id: str = "pt-call") -> "MCPServer":
+        return MCPServer(
+            server_id=server_id,
+            name=f"{server_id}-server",
+            url="https://up.example.com/mcp",
+            transport=MCPTransport.http,
+            auth_type=auth_type,
+        )
+
+    async def _run_call_regular(self, manager, server):
+        return await manager._call_regular_mcp_tool(
+            mcp_server=server,
+            original_tool_name="tool",
+            arguments={},
+            tasks=[],
+            mcp_auth_header=None,
+            mcp_server_auth_headers=None,
+            oauth2_headers=None,
+            raw_headers={"authorization": "Bearer caller-upstream-token"},
+            proxy_logging_obj=None,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auth_type", [MCPAuth.true_passthrough, MCPAuth.oauth_delegate])
+    @pytest.mark.parametrize("status_code", [401, 403])
+    async def test_call_relays_upstream_auth_failure_for_client_forwarded_modes(self, auth_type, status_code):
+        """A client-forwarded pass-through/delegate call must relay an upstream 401/403 as
+        MCPUpstreamAuthError with the upstream WWW-Authenticate preserved, so single-server REST
+        routes challenge the caller instead of masking it as a generic isError tool result. The relay
+        opts into raise_on_error so the transport failure surfaces rather than degrading silently."""
+        server = self._passthrough_call_server(auth_type)
+        challenge = f'Bearer resource_metadata="/.well-known/oauth-protected-resource/mcp/{server.name}"'
+        manager = MCPServerManager()
+        mock_client = AsyncMock()
+        mock_client.call_tool = AsyncMock(side_effect=self._upstream_status_error(status_code, challenge))
+        manager._create_mcp_client = AsyncMock(return_value=mock_client)
+
+        with pytest.raises(MCPUpstreamAuthError) as exc_info:
+            await self._run_call_regular(manager, server)
+
+        assert exc_info.value.status_code == status_code
+        assert exc_info.value.www_authenticate == challenge
+        assert mock_client.call_tool.call_args.kwargs.get("raise_on_error") is True
+
+    @pytest.mark.asyncio
+    async def test_call_passthrough_non_auth_error_stays_iserror(self):
+        """A non-auth upstream failure (e.g. 503) on a pass-through call keeps the default isError
+        degradation instead of relaying, so only genuine 401/403 re-auth signals become a challenge."""
+        from litellm.experimental_mcp_client.client import MCPClient
+
+        server = self._passthrough_call_server(MCPAuth.true_passthrough, server_id="pt-503")
+        manager = MCPServerManager()
+        mock_client = AsyncMock()
+        mock_client.call_tool = AsyncMock(side_effect=self._upstream_status_error(503))
+        mock_client.error_tool_result = MCPClient.error_tool_result
+        manager._create_mcp_client = AsyncMock(return_value=mock_client)
+
+        result = await self._run_call_regular(manager, server)
+
+        assert result.isError is True
+
+    @pytest.mark.asyncio
+    async def test_call_non_passthrough_does_not_opt_into_raise_on_error(self):
+        """Non-client-forwarded auth types keep the default call_tool masking (raise_on_error stays
+        off), so this relay is scoped to the pass-through modes and cannot regress api_key/OBO calls."""
+        server = MCPServer(
+            server_id="ak-call",
+            name="ak-call-server",
+            url="https://up.example.com/mcp",
+            transport=MCPTransport.http,
+            auth_type=MCPAuth.api_key,
+            authentication_token="static-key",
+        )
+        manager = MCPServerManager()
+        mock_client = AsyncMock()
+        mock_client.call_tool = AsyncMock(return_value=CallToolResult(content=[], isError=False))
+        manager._create_mcp_client = AsyncMock(return_value=mock_client)
+
+        result = await manager._call_regular_mcp_tool(
+            mcp_server=server,
+            original_tool_name="tool",
+            arguments={},
+            tasks=[],
+            mcp_auth_header=None,
+            mcp_server_auth_headers=None,
+            oauth2_headers=None,
+            raw_headers=None,
+            proxy_logging_obj=None,
+        )
+
+        assert result.isError is False
+        assert mock_client.call_tool.call_args.kwargs.get("raise_on_error") is not True
+
     def _token_exchange_server(self, server_id: str) -> "MCPServer":
         return MCPServer(
             server_id=server_id,

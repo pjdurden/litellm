@@ -3960,10 +3960,33 @@ class MCPServerManager:
 
             tool_call_coro = _obo_call_tool_limited()
         else:
+            relays_upstream_auth = mcp_server.is_true_passthrough or mcp_server.is_oauth_delegate
 
             async def _call_tool_via_client(client, params):
                 async with self._limit_outbound_concurrency(mcp_server):
-                    return await client.call_tool(params, host_progress_callback=host_progress_callback)
+                    if not relays_upstream_auth:
+                        return await client.call_tool(params, host_progress_callback=host_progress_callback)
+                    # The client-forwarded modes carry the caller's own upstream token, so an
+                    # upstream 401/403 on the call is the caller's to resolve: relay it as
+                    # MCPUpstreamAuthError so single-server REST callers can turn it into a 401/403 +
+                    # WWW-Authenticate and re-run the upstream OAuth flow, instead of masking it as a
+                    # generic isError tool result. raise_on_error only re-raises transport failures
+                    # (tool-level isError results are still returned normally); a non-auth transport
+                    # failure keeps the same isError degradation the default path produces.
+                    try:
+                        return await client.call_tool(
+                            params, host_progress_callback=host_progress_callback, raise_on_error=True
+                        )
+                    except Exception as e:
+                        auth_info = _extract_upstream_auth_failure(e)
+                        if auth_info is None:
+                            return client.error_tool_result(e)
+                        status_code, www_authenticate = auth_info
+                        raise MCPUpstreamAuthError(
+                            status_code=status_code,
+                            www_authenticate=www_authenticate,
+                            server_name=mcp_server.name or mcp_server.server_name or mcp_server.alias or "",
+                        ) from e
 
             tool_call_coro = _call_tool_via_client(client, call_tool_params)
 

@@ -114,6 +114,21 @@ if MCP_AVAILABLE:
         if isinstance(logging_error, BaseException):
             verbose_logger.warning("MCP tool call logging failed (continuing): %s", logging_error)
 
+    async def _execute_mcp_tool_or_relay_upstream_auth(request: Request, **kwargs: Any) -> Any:
+        """Run execute_mcp_tool, converting a client-forwarded pass-through 401/403
+        (MCPUpstreamAuthError) into an HTTPException that preserves any upstream WWW-Authenticate, so
+        a standards-compliant MCP client can run the upstream OAuth flow instead of the generic 500
+        the call endpoint's catch-all would otherwise return. The conversion lives here rather than
+        inline so the already-complex endpoint gains no branch."""
+        try:
+            return await execute_mcp_tool(**kwargs)
+        except MCPUpstreamAuthError as e:
+            verbose_logger.info(f"Upstream auth failure in MCP tool call: HTTP {e.status_code}")
+            raise e.to_http_exception(
+                base_url=get_request_base_url(request),
+                request_path=request.scope.get("_original_path") or request.url.path,
+            )
+
     def _get_server_auth_header(
         server,
         mcp_server_auth_headers: Optional[Dict[str, Dict[str, str]]],
@@ -959,7 +974,8 @@ if MCP_AVAILABLE:
 
             # Call execute_mcp_tool directly (permission checks already done)
             _tool_start_time = datetime.now()
-            result = await execute_mcp_tool(
+            result = await _execute_mcp_tool_or_relay_upstream_auth(
+                request,
                 name=tool_name,
                 arguments=tool_arguments,
                 allowed_mcp_servers=allowed_mcp_servers,

@@ -1005,6 +1005,22 @@ if MCP_AVAILABLE:
                     content=[TextContent(text=f"Error: {str(e.detail)}", type="text")],
                     isError=True,
                 )
+            except MCPUpstreamAuthError as e:
+                # The MCP session manager serializes handler exceptions as JSON-RPC errors, so a
+                # mid-session tool call cannot emit a raw 401 + WWW-Authenticate the way the REST
+                # call path and the connect-time preemptive check do. Return an explicit isError
+                # naming the upstream status (at info level, not a traceback) so the client still
+                # learns it must re-authenticate upstream and expected pass-through 401s don't spam.
+                verbose_logger.info(f"Upstream auth failure calling MCP tool: HTTP {e.status_code}")
+                return CallToolResult(
+                    content=[
+                        TextContent(
+                            text=f"Error: upstream authentication required (HTTP {e.status_code})",
+                            type="text",
+                        )
+                    ],
+                    isError=True,
+                )
             except Exception as e:
                 verbose_logger.exception(f"MCP mcp_server_tool_call - error: {e}")
                 return CallToolResult(

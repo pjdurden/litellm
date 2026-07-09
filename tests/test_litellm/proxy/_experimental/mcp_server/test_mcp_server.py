@@ -110,6 +110,44 @@ async def test_mcp_server_tool_call_body_contains_request_data():
     assert body["arguments"] == tool_arguments
 
 
+@pytest.mark.asyncio
+async def test_mcp_server_tool_call_relays_upstream_auth_error_as_iserror():
+    """The MCP session manager serializes handler exceptions as JSON-RPC errors, so a mid-session
+    tool call cannot emit a raw 401 the way the REST path does. mcp_server_tool_call must turn an
+    upstream MCPUpstreamAuthError into an explicit isError result naming the status, not a masked
+    500 or a raw traceback, so the client still learns it must re-authenticate upstream."""
+    try:
+        from litellm.proxy._experimental.mcp_server.exceptions import MCPUpstreamAuthError
+        from litellm.proxy._experimental.mcp_server.server import (
+            mcp_server_tool_call,
+            set_auth_context,
+        )
+    except ImportError:
+        pytest.skip("MCP server not available")
+
+    set_auth_context(UserAPIKeyAuth(api_key="test_key", user_id="test_user"))
+
+    async def mock_add_litellm_data_to_request(data, request, user_api_key_dict, proxy_config):
+        return data
+
+    async def mock_call_mcp_tool(*args, **kwargs):
+        raise MCPUpstreamAuthError(status_code=401, www_authenticate="Bearer", server_name="pt")
+
+    with patch(
+        "litellm.proxy.litellm_pre_call_utils.add_litellm_data_to_request",
+        mock_add_litellm_data_to_request,
+    ):
+        with patch(
+            "litellm.proxy._experimental.mcp_server.server.call_mcp_tool",
+            mock_call_mcp_tool,
+        ):
+            with patch("litellm.proxy.proxy_server.proxy_config", MagicMock()):
+                result = await mcp_server_tool_call("test_tool", {"param": "value"})
+
+    assert result.isError is True
+    assert "401" in result.content[0].text
+
+
 def test_prepare_mcp_server_headers_case_insensitive_extra_headers():
     try:
         from litellm.proxy._experimental.mcp_server.server import (
